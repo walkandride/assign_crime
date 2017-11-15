@@ -1,0 +1,407 @@
+---
+title: "Virginia Beach Crime Clusters"
+author: "John Sinues"
+output: 
+  html_document
+---
+
+# Introduction
+
+This is an attempt to perform cluster analysis on the [Virginia Beach police incident crime file](https://data.vbgov.com/Public-Safety/Police-Incident-Reports/iqkq-gr5p).
+
+In my initial attempts, I ran into problems processing the entire dataset.  Trying to process the dataset resulted in slow performance and insufficient memory errors.  My i5-2540M 16GB Windows 10 Pro laptop and my coding implementation were not up to the task.  
+
+I revised how I processed the data.  Breaking up the dataset by year, resulted in similar problems if there were a large number of data points.  Further filtering by year and quarter solved my issues.
+
+Let's begin.
+
+
+```{r init, message=FALSE, warning=FALSE, error=FALSE}
+rm(list = ls())
+
+library(tidyverse)
+
+```
+
+### Load CSV file.
+
+```{r load_file, cache=TRUE, warning=FALSE, message=FALSE}
+library(lubridate)
+library(stringr)
+
+# get file
+df <- read_csv("Data/Police_Incident_Reports.csv")
+
+# extract specific fields to process
+df.1 <- df %>% dplyr::select("Police Case Number", "Location", "Date Occured")
+# create a "coordinates" column and extract lat/lng from the location column
+df.1$coord <- gsub("[()]", "", str_extract(df.1$Location, "\\((.*)"))
+# break coord column into lat and lng columns
+df.1 <- df.1 %>% separate(coord, c("lat", "lng"), sep = ",", remove=FALSE)
+# make lat and lng columns numeric
+df.1$lat <- as.numeric(df.1$lat)
+df.1$lng <- as.numeric(df.1$lng)
+# create year and qtr columns
+df.1$year <- year(mdy_hms(df.1$`Date Occured`))
+df.1$qtr <- quarter(mdy_hms(df.1$`Date Occured`))
+
+# define years to perform analysis
+start_year <- 2014
+end_year <- 2017
+
+# define VB max longitude and latitude
+max_vb_lng <- -77
+max_vb_lat <- 37
+
+
+set.seed(334455)
+
+```
+
+### What does the data look like?
+
+```{r first_look, fig.height=8, fig.width=8}
+
+# get records that have a lat and lng
+df.1 <- df.1 %>% filter(!is.na(lat) & !is.na(lng))
+
+print(ggplot(df.1 %>% 
+               dplyr::select(lat, lng) %>% 
+               filter(complete.cases(.))
+       , aes(lng, lat)) +
+       geom_point() +
+       labs(title = paste0("Virginia Beach Crime Incidents "
+                          , "("
+                          , min(df.1$year)
+                          , "-"
+                          , max(df.1$year)
+                          , ")")
+            , x = "Longitude"
+            , y = "Latitude"))
+
+```
+
+Bad data found.  Any longitude less than `r max_vb_lng` and a latitude greater than `r max_vb_lat` is outside of Virginia Beach.
+
+```{r bad_records}
+df.2 <- df.1 %>% filter((lng < max_vb_lng) | (lat > max_vb_lat))
+#knitr::kable(df.2, caption = "Non Virginia Beach Locations")
+# display unformatted dataframe -- RMarkdown tables don't display this data well
+as.data.frame(df.2)
+
+```
+
+Exclude above records from the analysis.
+
+```{r revised_look, fig.height=8, fig.width=8}
+df.1 <- anti_join(df.1, df.2, by = "Police Case Number") 
+
+print(ggplot(df.1
+       , aes(lng, lat)) +
+       geom_point() +
+       labs(title = paste0("Virginia Beach Crime Incidents "
+                          , "("
+                          , min(df.1$year)
+                          , "-"
+                          , max(df.1$year)
+                          , ")")
+            , x = "Longitude"
+            , y = "Latitude"))
+
+```
+
+
+### Breakdown of incidents by year and quarter.
+
+```{r incident_table}
+table(df.1$year, df.1$qtr)
+
+```
+
+---
+
+**There is not much data prior to `r start_year`.  Given this information, let's base the cluster analysis on data from `r start_year` forward.**
+
+---
+
+
+```{r}
+# Return dataframe filtered by year and quarter
+filter_data = function(y, q) {
+  d <- df.1 %>%
+    dplyr::select(lat, lng, year, qtr) %>%
+    filter(year == y & qtr == q)
+    d
+}
+
+```
+
+```{r, message=FALSE, warning=FALSE, fig.height=8, fig.width=8}
+# https://gis.stackexchange.com/questions/17638/how-to-cluster-spatial-data-in-r
+
+# Core functionality based upon the above link to indentify clusters.
+library(sp)
+library(rgdal)
+library(geosphere)
+library(dismo)
+library(rgeos)
+
+plot_cluster = function(y, q) {
+  # get filtered data
+  x <- filter_data(y, q)
+  
+  # convert data to a SpatialPointsDataFrame object
+  xy <- SpatialPointsDataFrame(
+    matrix(c(x$lng, x$lat), ncol = 2),
+    data.frame(ID = seq(1:length(x$lng))),
+    proj4string = CRS("+proj=longlat +ellps=WGS84 +datum=WGS84")
+    )
+    
+  # use the distm function to generate a geodesic distance matrix in meters
+  mdist <- distm(xy)
+  
+  # cluster all points using a hierarchical clustering approach
+  hc <- hclust(as.dist(mdist), method = "complete")
+  
+  # define the distance threshold, in this case 
+  d = 12875 # 8 miles to meters
+  
+  # define clusters based on a tree "height" cutoff "d" and add them to the SpDataFrame
+  xy$clust <- cutree(hc, h = d)
+  
+  # expand the extent of plotting frame
+  xy@bbox[] <- as.matrix(extend(extent(xy), 0.001))
+  
+  # get the centroid coords for each cluster
+  cent <- matrix(ncol = 2, nrow = max(xy$clust))
+  for (i in 1:max(xy$clust)) {
+    # gCentroid from the rgeos package
+    cent[i,] <- gCentroid(subset(xy, clust == i))@coords
+  }
+  
+  # compute circles around the centroid coords using the above radius
+  # from the dismo package
+  ci <- circles(cent, lonlat = T)
+  
+  # plot
+  plot(ci@polygons, axes = T)
+  plot(xy, col = rainbow(4)[factor(xy$clust)], add = T)
+  points(cent, cex = 1, pch=18)
+  title(main = paste(y, " Quarter ", q))
+
+  # return center coordinates for clusters  
+  cent
+}
+
+```
+
+```{r}
+# Helper function to convert a center coordinate matrix into a dataframe and
+# add year and qtr columns.
+get_df = function(m, y, q) {
+  # convert matrix to dataframe and add year and qtr columns
+  df <- as.data.frame(m)
+  df["year"] <- y
+  df["qtr"] <- q
+  colnames(df) <- c("lng", "lat", "year", "qtr")
+  df
+}
+
+```
+
+### Plot clusters by year and quarter.
+
+```{r graph_clusters, cache=TRUE, fig.height=8, fig.width=8}
+for (year in start_year:end_year) {
+  for (qtr in 1:4) {
+    # create a dataframe of cluster centers for each year and qtr
+    if (year == start_year & qtr == 1) {
+      # first dataframe
+      df.centers <- get_df(plot_cluster(year, qtr), year, qtr)
+    } else {
+      df.centers <- bind_rows(df.centers, get_df(plot_cluster(year, qtr), year, qtr))
+    }
+  }
+}
+
+```
+
+
+### Cluster center details.
+
+```{r cluster_ctrs, fig.height=10, fig.width=10}
+knitr::kable(table(df.centers$year, df.centers$qtr)
+             , caption = "Number Of Clusters By Year And Quarter")
+knitr::kable(df.centers
+             , caption = "Cluster Center coordinates")
+
+
+for (y in start_year:end_year) {
+  c <- df.centers %>% filter(year == y)
+  
+  print(ggplot(c
+         , aes(lng, lat)) +
+         geom_point() +
+         geom_text(aes(label=paste0(round(lng, 3), ',', round(lat,3)), hjust = 0.5, vjust=1)
+                   , size=2.5
+                   , color="blue") +
+         facet_wrap( ~ qtr, labeller = label_both) +
+         labs(title = paste(y, " Cluster"), x = "Longitude", y = "Latitude"))
+}
+
+rm(c)
+
+```
+
+
+### Overlay cluster centers on map.
+
+```{r cluster_map, message=FALSE, fig.width = 12, fig.height = 16}
+library(leaflet)
+
+# create a palette for cluster years
+pal <- colorFactor(c(palette()[3], palette()[4], palette()[5], palette()[6])
+                   , domain = as.factor(df.centers$year))
+
+# get Virginia Beach police precincts
+vbPrecincts <- read_csv("Data/vb_precincts.csv")
+
+# create custom icon for precincts
+icons <- awesomeIcons(
+  icon = 'glyphicon-earphone'
+  , iconColor = 'black'
+  , library = 'glyphicon'
+)
+
+map <- leaflet(df.centers) %>%
+  addTiles() %>%
+  addAwesomeMarkers(lng=vbPrecincts$lng, lat=vbPrecincts$lat, popup=vbPrecincts$descr, icon=icons) %>%
+  addCircleMarkers(lng=df.centers$lng
+             , lat=df.centers$lat
+             , popup=paste0('[', df.centers$year, '-', df.centers$qtr, '] ('
+                            , round(df.centers$lng, 3), ',', round(df.centers$lat,3), ')')
+             , color = ~pal(df.centers$year)
+             , radius = 3
+             , fillOpacity = 0.5
+             ) %>%
+             setView(-76.1339487, 36.8464062, 11)
+                                                  
+map
+
+```
+
+### Other things to do and explore.
+
+* Identify number of incidents per cluster
+* Re-explore DBSCAN clustering.  Compare results.
+
+
+```{r, echo=FALSE, eval=FALSE}
+# Notes
+
+# https://stackoverflow.com/questions/28672399/spatial-clustering-in-r-simple-example
+# https://gis.stackexchange.com/questions/17638/how-to-cluster-spatial-data-in-r
+
+# https://stackoverflow.com/questions/28672399/spatial-clustering-in-r-simple-example
+
+DBSCAN:  So the idea behind DBSCAN is to try and ignore the data points that are more spread out and focus on the dense parts, which should be the central cores of the clusters.
+
+library(fpc)
+# 2 EPS = 0.03125 
+# 4 EPS = 0.015625
+# 19 EPS = 0.0078125
+EPS = 0.0111
+
+#clusters <- dbscan::dbscan(x = x, eps = EPS)
+clusters <- fpc::dbscan(data = x, eps = EPS, MinPts=15, method="hybrid")
+x$cluster <- clusters$cluster
+
+groups <- x %>% filter(cluster != 0)
+noise <- x %>% filter(cluster == 0)
+
+
+ggplot(x, aes(x = lng, y = lat, alpha = 0.5)) +
+#  geom_point(aes(fill = "grey"), noise) +
+#  geom_point(aes(colour = "grey"), noise, size = 2) +
+  geom_point(aes(colour = as.factor(cluster)), groups, size = 1) +
+#  coord_map() +
+  geom_density_2d() +
+  theme_classic() +
+  theme(legend.position = "none") +
+  labs(title = "Crime Incidents", x = "longitude", y = "latitude") 
+
+max(groups$cluster)
+
+# http://www.sthda.com/english/articles/30-advanced-clustering/105-dbscan-density-based-clustering-essentials/#parameter-estimation
+#library(factoextra)
+#fviz_cluster(clusters, data = x, stand = FALSE,
+#             ellipse = FALSE, show.clust.cent = FALSE,
+#             geom = "point",palette = "jco", ggtheme = theme_classic())
+
+
+# https://stackoverflow.com/questions/21095643/approaches-for-spatial-geodesic-latitude-longitude-clustering-in-r-with-geodesic
+library(fossil)
+x.1 <- data.frame(lng=x$lng, lat=x$lat)
+
+geo.dist = function(df) {
+  require(geosphere)
+  d <- function(i,z){         # z[1:2] contain long, lat
+    dist <- rep(0,nrow(z))
+    dist[i:nrow(z)] <- distHaversine(z[i:nrow(z),1:2],z[i,1:2])
+    return(dist)
+  }
+  dm <- do.call(cbind,lapply(1:nrow(df),d,df))
+  return(as.dist(dm))
+}
+
+d <- dist(x.1) #geo.dist(x.1)
+h1 <- hclust(d)
+plot(h1)
+
+# https://stackoverflow.com/questions/28672399/spatial-clustering-in-r-simple-example
+
+library(fields)
+threshold.in.km <- 20
+coors <- data.frame(x$lng,x$lat)
+
+#distance matrix
+dist.in.km.matrix <- rdist.earth(coors,miles = F,R=6371)
+
+#clustering
+fit <- hclust(as.dist(dist.in.km.matrix), method = "single")
+clusters <- cutree(fit,h = threshold.in.km)
+
+plot.new()
+plot(coors$lng, coors$lat, col = clusters, pch = 20)
+
+#EPS <- 7
+#cluster.dbscan <- dbscan(x
+#                          , eps = EPS, minPts = 30, borderPoints = T, search = "kdtree")
+#plot(lat ~ lng, data = df.1, col = cluster.dbscan$cluster + 1L, pch = 20)
+
+
+
+# https://stackoverflow.com/questions/22876270/plotting-temperatures-of-cities-in-virginia-using-maps-in-r
+library(maps)
+map("state", "Virginia")
+text(tempdat$long, tempdat$lat, label=tempdat$temperature)
+
+data(us.cities)
+tempdat= us.cities[us.cities$country.etc == "VA", ]
+tempdat$temperature = round(rnorm(nrow(tempdat), mean=75, sd=5))
+
+```
+
+### Endnotes.
+
+Loaded packages.
+```{r, message=FALSE}
+sessionInfo()
+
+```
+
+
+***
+
+###### Report generated:  `r Sys.time()`
+
